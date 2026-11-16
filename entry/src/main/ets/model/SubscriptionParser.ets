@@ -28,6 +28,13 @@ export interface SubscriptionResult {
 export class SubscriptionParser {
   static parse(text: string): SubscriptionResult {
     const json = SubscriptionParser.parseJson(text);
+    // 裸数组两种含义（与上游一致）：
+    //   [{ name, baseUrl }]  → 接口目录（source-catalog），只含点播接口
+    //   [{ name, url }]      → 纯点播源列表
+    // 一整份 TVBOX 配置常以对象形式给出，所以数组分支不影响原有格式。
+    if (Array.isArray(json)) {
+      return SubscriptionParser.parseCatalog(json as object[]);
+    }
     if (SubscriptionParser.isTvboxPayload(json)) {
       return SubscriptionParser.parseTvbox(json);
     }
@@ -35,7 +42,7 @@ export class SubscriptionParser {
   }
 
   /**
-   * 弹性导入：自动识别订阅 JSON（LibreTV / TVBOX）或直播播放列表（M3U / TXT）。
+   * 弹性导入：自动识别订阅 JSON（LibreTV / TVBOX / 接口目录）或直播播放列表（M3U / TXT）。
    */
   static parseFlexible(text: string): FlexibleParseResult {
     const trimmed = text.replace(/^\uFEFF/, '').trim();
@@ -43,11 +50,17 @@ export class SubscriptionParser {
       throw new Error('内容为空');
     }
     if (!SubscriptionParser.isLivePlaylistText(trimmed)) {
+      const first = trimmed.substring(0, 1);
       try {
         const sub = SubscriptionParser.parse(trimmed);
         return { kind: 'json', sub: sub, channels: [] };
       } catch (e) {
-        // 不是 JSON，继续按播放列表解析
+        // 内容明显是 JSON（以 { 或 [ 开头）时把真实原因抛出去。
+        // 否则用户看到的永远是「无法识别的内容」，而真正的问题可能是
+        // 「baseUrl 与 url 混用」这类具体的格式错误 —— 完全没法自查。
+        if (first === '{' || first === '[') {
+          throw e as Error;
+        }
       }
     }
     const channels = M3uParser.parse(trimmed, '');
@@ -55,6 +68,88 @@ export class SubscriptionParser {
       throw new Error('无法识别的内容：不是订阅 JSON，也不是 M3U / TXT 播放列表');
     }
     return { kind: 'playlist', channels: channels };
+  }
+
+  /**
+   * 接口目录（source-catalog）：裸数组，元素为 { name, baseUrl, enabled }。
+   * 只导入点播接口，不含直播源。
+   *
+   * 之所以要严格区分 baseUrl / url 两种条目：混用时若静默取其一，
+   * 用户的一半源会凭空消失且没有任何提示 —— 宁可整份报错让他去改。
+   */
+  static parseCatalog(arr: object[]): SubscriptionResult {
+    let withBase = 0;
+    let withUrl = 0;
+    for (const raw of arr) {
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        continue;
+      }
+      const item = raw as Record<string, object>;
+      if (SubscriptionParser.str(item['baseUrl']).trim() !== '') {
+        withBase++;
+      } else if (SubscriptionParser.str(item['url']).trim() !== '') {
+        withUrl++;
+      }
+    }
+    if (withBase > 0 && withUrl > 0) {
+      throw new Error('格式错误：baseUrl 与 url 不能混用（接口目录用 baseUrl，普通源列表用 url）');
+    }
+    if (withBase === 0 && withUrl === 0) {
+      throw new Error('格式错误：数组里没有 baseUrl / url');
+    }
+    const asCatalog = withBase > 0;
+    const vod: VodSource[] = [];
+    let skipped = 0;
+    for (const raw of arr) {
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+        skipped++;
+        continue;
+      }
+      const item = raw as Record<string, object>;
+      if (!SubscriptionParser.bool(item['enabled'], true)) {
+        skipped++;
+        continue;
+      }
+      const rawUrl = SubscriptionParser.str(asCatalog ? item['baseUrl'] : item['url']);
+      const url = SubscriptionParser.normalizeUrl(rawUrl, true);
+      if (url === '') {
+        skipped++;
+        continue;
+      }
+      let dup = false;
+      for (const v of vod) {
+        if (v.url === url) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        continue;
+      }
+      if (vod.length >= SourceManager.MAX_VOD) {
+        skipped++;
+        continue;
+      }
+      const name = SubscriptionParser.str(item['name']);
+      vod.push({
+        key: '',
+        name: name !== '' ? name : url,
+        url: url,
+        detail: undefined,
+        enabled: true,
+        isAdult: SubscriptionParser.bool(item['isAdult'], false),
+        failStreak: 0,
+        disabledUntil: 0
+      });
+    }
+    return {
+      name: '',
+      format: asCatalog ? 'catalog' : 'libretv',
+      vod: vod,
+      live: [] as LiveSource[],
+      skipped: skipped,
+      skipDesc: ''
+    };
   }
 
   /** 内容是否为直播播放列表文本（M3U 头或 TVBOX TXT 分组标记） */

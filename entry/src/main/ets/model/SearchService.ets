@@ -5,7 +5,7 @@
 
 import { CmsClient } from './CmsClient';
 import { SourceManager } from '../data/SourceManager';
-import { Settings, VodSource, SearchItem, MergedVideo, SpeedTestItem } from './Types';
+import { Settings, VodSource, SearchItem, MergedVideo, SpeedTestItem, CmsSearchPage } from './Types';
 import { HttpClient } from '../net/HttpClient';
 import { Utils } from '../common/Utils';
 
@@ -21,32 +21,53 @@ interface SourceSearchResult {
 }
 
 export class SearchService {
-  /** 聚合搜索 */
+  /**
+   * 单个源的总死线（含全部分页）。
+   * 上游 SEARCH_SOURCE_TIMEOUT_MS 默认 10s，移动网络略慢，这里给 12s。
+   * 到点后已经发出的分页请求不强行中断（HTTP 层自己有 8s 超时），
+   * 但不再补发后续页，避免「一个半死的源拖住整次搜索」。
+   */
+  private static readonly SOURCE_DEADLINE_MS: number = 12000;
+
+  /**
+   * 同时进行的源数量。
+   * 上游跑在服务器上，可以几百个请求一起发；手机不行 ——
+   * 100 个源 × 5 页 = 500 个并发会把移动网络的连接池打爆，
+   * 表现为「搜索转很久然后一堆源报超时」，比只搜一页还差。
+   * 分波跑既能压住峰值，又不会让常见规模（十几个源）变慢。
+   */
+  private static readonly SOURCE_CONCURRENCY: number = 8;
+
+  /** 聚合搜索（多页） */
   static async aggregate(wd: string, settings: Settings): Promise<AggregateResult> {
     const sm = SourceManager.shared();
     const sources = sm.searchableVodSources(settings.adultFilter);
+    const maxPages: number = SearchService.clampPages(settings.searchMaxPages);
     const results: SearchItem[] = [];
     let failed = 0;
-    const wrapped: Promise<SourceSearchResult>[] = [];
-    for (const s of sources) {
-      wrapped.push(
-        CmsClient.search(s, wd)
-          .then((items: SearchItem[]): SourceSearchResult => ({ ok: true, source: s, items: items }))
-          .catch((): SourceSearchResult => ({ ok: false, source: s, items: [] as SearchItem[] }))
-      );
-    }
-    const settled = await Promise.all(wrapped);
-    for (const r of settled) {
-      if (r.ok) {
-        sm.recordSuccess(r.source.key);
-        for (const item of r.items) {
-          results.push(item);
+
+    let index = 0;
+    while (index < sources.length) {
+      const wave: VodSource[] = sources.slice(index, index + SearchService.SOURCE_CONCURRENCY);
+      index += SearchService.SOURCE_CONCURRENCY;
+      const jobs: Promise<SourceSearchResult>[] = [];
+      for (const s of wave) {
+        jobs.push(SearchService.searchSource(s, wd, maxPages));
+      }
+      const settled = await Promise.all(jobs);
+      for (const r of settled) {
+        if (r.ok) {
+          sm.recordSuccess(r.source.key);
+          for (const item of r.items) {
+            results.push(item);
+          }
+        } else {
+          sm.recordFailure(r.source.key);
+          failed++;
         }
-      } else {
-        sm.recordFailure(r.source.key);
-        failed++;
       }
     }
+
     // 过滤：成人分类 + 相关性
     const filtered: SearchItem[] = [];
     for (const item of results) {
@@ -60,11 +81,11 @@ export class SearchService {
     }
     // 跨源同名合并
     const groups: MergedVideo[] = [];
-    const index = new Map<string, MergedVideo>();
+    const index2 = new Map<string, MergedVideo>();
     for (const item of filtered) {
       const year = item.year !== undefined ? item.year : '';
       const key = Utils.normalizeTitle(item.name) + '|' + year;
-      let g = index.get(key);
+      let g = index2.get(key);
       if (g === undefined) {
         g = {
           name: item.name,
@@ -75,12 +96,54 @@ export class SearchService {
           area: item.area,
           items: []
         };
-        index.set(key, g);
+        index2.set(key, g);
         groups.push(g);
       }
       g.items.push(item);
     }
     return { merged: groups, failedCount: failed };
+  }
+
+  private static clampPages(v: number): number {
+    if (v === undefined || Number.isNaN(v) || v < 1) {
+      return 1;
+    }
+    return v > 50 ? 50 : Math.floor(v);
+  }
+
+  /**
+   * 抓一个源的全部页。
+   * 先抓第一页（顺便拿 pagecount），再并行抓其余页；
+   * 单页失败只丢该页 —— 不能因为第 4 页 500 就把前 3 页的结果也扔掉。
+   */
+  private static async searchSource(s: VodSource, wd: string, maxPages: number): Promise<SourceSearchResult> {
+    const deadline: number = Date.now() + SearchService.SOURCE_DEADLINE_MS;
+    let first: CmsSearchPage;
+    try {
+      first = await CmsClient.searchPage(s, wd, 1);
+    } catch (e) {
+      return { ok: false, source: s, items: [] as SearchItem[] };
+    }
+    const items: SearchItem[] = first.items.slice();
+    let pages: number = maxPages;
+    if (first.totalPage > 0 && first.totalPage < pages) {
+      pages = first.totalPage;
+    }
+    if (pages > 1 && Date.now() < deadline) {
+      const jobs: Promise<SearchItem[]>[] = [];
+      for (let p = 2; p <= pages; p++) {
+        jobs.push(CmsClient.searchPage(s, wd, p)
+          .then((r: CmsSearchPage): SearchItem[] => r.items)
+          .catch((): SearchItem[] => [] as SearchItem[]));
+      }
+      const more = await Promise.all(jobs);
+      for (const arr of more) {
+        for (const it of arr) {
+          items.push(it);
+        }
+      }
+    }
+    return { ok: true, source: s, items: items };
   }
 
   /**

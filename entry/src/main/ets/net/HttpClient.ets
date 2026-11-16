@@ -32,7 +32,17 @@ export class HttpClient {
   }
 
   static async getText(url: string, headers: Record<string, string> = {}, timeoutMs: number = 10000): Promise<HttpResult> {
-    return await HttpClient.get(url, headers, timeoutMs, false);
+    return await HttpClient.send(http.RequestMethod.GET, url, headers, timeoutMs, false, '');
+  }
+
+  /**
+   * POST 文本并返回响应文本。
+   * 「发布为链接」要把订阅 JSON 投递到公开粘贴板，这是本项目唯一的写请求，
+   * 所以单独开一个入口而不是把 method 暴露给所有调用方。
+   */
+  static async postText(url: string, body: string, headers: Record<string, string> = {},
+    timeoutMs: number = 15000): Promise<HttpResult> {
+    return await HttpClient.send(http.RequestMethod.POST, url, headers, timeoutMs, false, body);
   }
 
   /**
@@ -118,19 +128,23 @@ export class HttpClient {
   }
 
   static async getBytes(url: string, headers: Record<string, string> = {}, timeoutMs: number = 10000): Promise<HttpResult> {
-    return await HttpClient.get(url, headers, timeoutMs, true);
+    return await HttpClient.send(http.RequestMethod.GET, url, headers, timeoutMs, true, '');
   }
 
-  private static async get(url: string, headers: Record<string, string>, timeoutMs: number, binary: boolean): Promise<HttpResult> {
+  private static async send(method: http.RequestMethod, url: string, headers: Record<string, string>,
+    timeoutMs: number, binary: boolean, body: string): Promise<HttpResult> {
     const httpRequest = http.createHttp();
     try {
       const options: http.HttpRequestOptions = {
-        method: http.RequestMethod.GET,
+        method: method,
         header: headers,
         connectTimeout: timeoutMs,
         readTimeout: timeoutMs,
         expectDataType: binary ? http.HttpDataType.ARRAY_BUFFER : http.HttpDataType.STRING
       };
+      if (body !== '') {
+        options.extraData = body;
+      }
       const response = await httpRequest.request(url, options);
       let bytes = new Uint8Array(0);
       let text = '';

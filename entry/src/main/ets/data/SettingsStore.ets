@@ -52,7 +52,18 @@ export class SettingsStore {
     if (patch.autoDiscover !== undefined) {
       s.autoDiscover = patch.autoDiscover;
     }
+    if (patch.searchMaxPages !== undefined) {
+      s.searchMaxPages = SettingsStore.clampPages(patch.searchMaxPages);
+    }
     this.save();
+  }
+
+  /** 页数上限夹到 1-50（与上游 SEARCH_MAX_PAGES 的取值范围一致） */
+  private static clampPages(v: number): number {
+    if (Number.isNaN(v) || v < 1) {
+      return 1;
+    }
+    return v > 50 ? 50 : Math.floor(v);
   }
 
   private load(): void {
@@ -86,6 +97,10 @@ export class SettingsStore {
       }
       this.settings.playHistoryEnabled = SettingsStore.bool(rec['playHistoryEnabled'], this.settings.playHistoryEnabled);
       this.settings.autoDiscover = SettingsStore.bool(rec['autoDiscover'], this.settings.autoDiscover);
+      const pages = SettingsStore.num(rec['searchMaxPages'], 0);
+      if (pages > 0) {
+        this.settings.searchMaxPages = SettingsStore.clampPages(pages);
+      }
     } catch (e) {
       // 数据损坏时用默认值
     }

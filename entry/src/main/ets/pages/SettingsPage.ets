@@ -28,6 +28,7 @@ export struct SettingsPage {
   @State defaultSpeed: number = SettingsStore.shared().get().defaultSpeed;
   @State playHistoryEnabled: boolean = SettingsStore.shared().get().playHistoryEnabled;
   @State autoDiscover: boolean = SettingsStore.shared().get().autoDiscover;
+  @State searchMaxPages: number = SettingsStore.shared().get().searchMaxPages;
   @State activePanel: string = '';
 
   private static readonly AD_FILTERS: OptionItem[] = [
@@ -46,7 +47,21 @@ export struct SettingsPage {
     { key: 'douban_movie', label: '豆瓣电影' },
     { key: 'douban_tv', label: '豆瓣电视剧' },
     { key: 'douban_rank', label: '豆瓣排行（Top 250）' },
-    { key: 'bangumi', label: '番组计划（Bangumi）' }
+    { key: 'bangumi', label: '番组计划（Bangumi）' },
+    // 与上游「影视榜单」对齐：豆瓣五个周榜 + 百度热播，数据经 60s API（免 key）
+    { key: 'hot-list', label: '影视榜单（周榜 + 百度热播）' }
+  ];
+
+  /**
+   * 搜索深度：每个源抓几页。
+   * 默认 5 与上游 SEARCH_MAX_PAGES 一致；调到 1 相当于旧版行为（最快、最省流量），
+   * 调到 10 能挖出更多冷门结果，代价是搜索变慢、流量变大。
+   */
+  private static readonly PAGES: OptionItem[] = [
+    { key: '1', label: '1 页（最快）' },
+    { key: '3', label: '3 页' },
+    { key: '5', label: '5 页（推荐，与 Web 版一致）' },
+    { key: '10', label: '10 页（最全，较慢）' }
   ];
 
   private static readonly SPEEDS: OptionItem[] = [
@@ -168,6 +183,17 @@ export struct SettingsPage {
                   this.save({ adultFilter: this.adultFilter });
                 }
               })
+
+              SettingsRow({
+                rowTitle: '搜索深度',
+                rowValue: this.searchMaxPages.toString() + ' 页',
+                onRowClick: () => {
+                  this.togglePanel('pages');
+                }
+              })
+              if (this.activePanel === 'pages') {
+                this.optionPanel('pages', SettingsPage.PAGES, this.searchMaxPages.toString())
+              }
 
               SettingsRow({
                 rowTitle: '首页推荐来源',
@@ -342,6 +368,12 @@ export struct SettingsPage {
       if (value > 0) {
         this.defaultSpeed = value;
         this.save({ defaultSpeed: value });
+      }
+    } else if (name === 'pages') {
+      const value = Number(key);
+      if (value > 0) {
+        this.searchMaxPages = value;
+        this.save({ searchMaxPages: value });
       }
     }
   }

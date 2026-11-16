@@ -15,6 +15,7 @@ import { DevicePolicy } from '../common/DevicePolicy';
 import { AppLifecycle } from '../common/AppLifecycle';
 import { SystemInsets } from '../common/SystemInsets';
 import { DeepLink, ShareLink } from '../common/ShareLink';
+import { SubscriptionSync } from '../model/SubscriptionSync';
 
 export default class EntryAbility extends UIAbility {
   /** 主窗口句柄：状态栏着色 / 主题切换后重涂都靠它 */
@@ -245,6 +246,13 @@ export default class EntryAbility extends UIAbility {
     // 只靠 60s 看门狗太慢，用户看到的就是「进度条一直不动」。
     // 已经在跑的任务会被 active 标记挡掉，重复调用无副作用。
     DownloadManager.shared().resumeInterrupted();
+    // 订阅到期检查：App 没有常驻进程，只能借「启动/回前台」当触发点。
+    // syncDue 内部会先筛一遍到期列表，没到期就是空转，不会产生网络请求。
+    setTimeout(() => {
+      SubscriptionSync.syncDue().catch(() => {
+        // 静默：自动刷新失败不弹窗，状态在订阅面板里看
+      });
+    }, 4000);
   }
 
   onBackground(): void {

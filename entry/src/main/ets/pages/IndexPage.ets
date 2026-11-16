@@ -13,6 +13,7 @@ import { EventBus, Events } from '../common/EventBus';
 import { DoubanClient, SuggestItem } from '../model/DoubanClient';
 import { SuggestEngine, SuggestSink } from '../model/SuggestEngine';
 import { BangumiClient } from '../model/BangumiClient';
+import { HotListClient } from '../model/HotListClient';
 import { HttpClient } from '../net/HttpClient';
 import { M3uParser } from '../model/M3uParser';
 import { CmsClient } from '../model/CmsClient';
@@ -76,6 +77,20 @@ const REC_CATS: RecCat[] = [
   { key: 'variety', label: '综艺', type: 'tv', tag: '综艺', tags: '综艺' },
   { key: 'doc', label: '纪录片', type: 'tv', tag: '纪录片', tags: '纪录片' },
   { key: 'anime', label: '动漫', type: 'tv', tag: '日本动画', tags: '动漫' }
+];
+
+/**
+ * 影视榜单的六个榜单（60s API）。
+ * 复用 RecCat 结构只是为了能直接交给 recChip 渲染，
+ * type / tag / tags 这三个豆瓣专用字段在榜单模式下不会被读到。
+ */
+const HOT_BOARDS: RecCat[] = [
+  { key: 'douban_movie_weekly', label: '电影周榜', type: '', tag: '', tags: '' },
+  { key: 'douban_tv_chinese', label: '国产剧', type: '', tag: '', tags: '' },
+  { key: 'douban_tv_global', label: '海外剧', type: '', tag: '', tags: '' },
+  { key: 'douban_show_chinese', label: '国内综艺', type: '', tag: '', tags: '' },
+  { key: 'douban_show_global', label: '海外综艺', type: '', tag: '', tags: '' },
+  { key: 'baidu_teleplay', label: '百度热播', type: '', tag: '', tags: '' }
 ];
 
 /** 排序方式：key 是豆瓣的 sort 参数，label 给用户看 */
@@ -223,6 +238,14 @@ struct IndexPage {
   private sourcesCb: () => void = () => {};
   private downloadsCb: () => void = () => {};
   private liveFavCb: () => void = () => {};
+  private settingsCb: () => void = () => {};
+  /**
+   * 上一次生效的首页推荐来源。
+   * 设置页改推荐源时只发 SETTINGS_CHANGED，而 initRecCat 原本只在 aboutToAppear 跑，
+   * 结果就是「改了设置要重启 APP 才生效」—— 本仓库一直存在这个问题。
+   * 这里记住旧值，变化时才重建分类并重拉，其余设置变更不干扰首页。
+   */
+  private lastRecommendSource: string = '';
 
   @State activeTab: number = 0;
 
@@ -278,6 +301,8 @@ struct IndexPage {
   @State recCatKey: string = 'movie';
   /** 豆瓣排行（Top250）模式：推荐来源选 douban_rank 时生效，分类/筛选条不适用 */
   @State recRank: boolean = false;
+  /** 影视榜单模式：推荐来源选 hot-list 时生效，分类换成六个周榜，没有筛选与分页 */
+  @State recHot: boolean = false;
   /** 影片类型筛选，空串表示不限 */
   @State recGenre: string = '';
   /** 发行地区筛选，空串表示不限 */
@@ -342,6 +367,7 @@ struct IndexPage {
     this.refreshHome();
     this.refreshCounts();
     this.initRecCat();
+    this.lastRecommendSource = SettingsStore.shared().get().recommendSource;
     // 源健康度定期自动探测：失败源按退避自动停用（= 自动关闭），坏源不再拖慢搜索
     SourceManager.shared().startAutoRefresh();
     // 自动发现源（设置开关默认关）：延迟 3 秒后台拉取聚合订阅并验活入库
@@ -366,6 +392,16 @@ struct IndexPage {
       // 直播收藏变化（直播页收藏/取消频道）：刷新「我的」页收藏计数
       this.refreshCounts();
     };
+    this.settingsCb = () => {
+      const src = SettingsStore.shared().get().recommendSource;
+      if (src === this.lastRecommendSource) {
+        return;
+      }
+      this.lastRecommendSource = src;
+      this.initRecCat();
+      this.recPageStart = 0;
+      this.loadRecommend();
+    };
     // 分享链接的落点：必须用箭头函数（成员方法当回调会丢 this）
     DeepLink.attach((link: string) => {
       this.onSharedLink(link);
@@ -374,6 +410,7 @@ struct IndexPage {
     EventBus.on(Events.SOURCES_CHANGED, this.sourcesCb);
     EventBus.on(Events.DOWNLOADS_CHANGED, this.downloadsCb);
     EventBus.on(Events.LIVE_FAV_CHANGED, this.liveFavCb);
+    EventBus.on(Events.SETTINGS_CHANGED, this.settingsCb);
   }
 
   aboutToDisappear(): void {
@@ -385,6 +422,7 @@ struct IndexPage {
     EventBus.off(Events.SOURCES_CHANGED, this.sourcesCb);
     EventBus.off(Events.DOWNLOADS_CHANGED, this.downloadsCb);
     EventBus.off(Events.LIVE_FAV_CHANGED, this.liveFavCb);
+    EventBus.off(Events.SETTINGS_CHANGED, this.settingsCb);
     DeepLink.detach();
   }
 
@@ -570,6 +608,21 @@ struct IndexPage {
   private initRecCat(): void {
     const src = SettingsStore.shared().get().recommendSource;
     this.recRank = src === 'douban_rank';
+    this.recHot = src === 'hot-list';
+    if (this.recHot) {
+      // 榜单模式下 recCatKey 存的是榜单 id，不是豆瓣分类
+      let keep: boolean = false;
+      for (const b of HOT_BOARDS) {
+        if (b.key === this.recCatKey) {
+          keep = true;
+          break;
+        }
+      }
+      if (!keep) {
+        this.recCatKey = HOT_BOARDS[0].key;
+      }
+      return;
+    }
     if (src === 'douban_tv') {
       this.recCatKey = 'tv';
     } else if (src === 'bangumi') {
@@ -631,6 +684,20 @@ struct IndexPage {
     let fallback: boolean = false;
     try {
       let items: RecommendItem[] = [];
+      if (this.recHot) {
+        // 影视榜单：60s API 一次全量返回，没有分页，也没有筛选/排序参数。
+        // 上游同样是「一次取完 + 缓存 1 小时」，所以这里把 hasMore 关掉，
+        // 让瀑布流老实显示「已经到底了」而不是空转翻页。
+        items = await HotListClient.fetch(this.recCatKey);
+        if (seq !== this.recSeq) {
+          return;
+        }
+        this.recommendItems = items;
+        this.recDataSource.setData(items);
+        this.recHasMore = false;
+        this.recPageStart = 0;
+        return;
+      }
       if (this.recRank) {
         // 豆瓣排行：Top250 HTML 榜单页，分类/筛选条不适用
         items = await DoubanClient.top250(start);
@@ -758,6 +825,19 @@ struct IndexPage {
 
   /** 换一批：推进分页起点后重新加载（浏览接口每页 20 条，Top250 每页 25 条） */
   private nextRecommend(): void {
+    if (this.recHot) {
+      // 榜单没有下一页，「换一批」在这里的含义是换下一个榜单 ——
+      // 比让它什么都不做要好：用户点了一定期待画面有变化。
+      this.recPageStart = 0;
+      for (let i = 0; i < HOT_BOARDS.length; i++) {
+        if (HOT_BOARDS[i].key === this.recCatKey) {
+          this.recCatKey = HOT_BOARDS[(i + 1) % HOT_BOARDS.length].key;
+          break;
+        }
+      }
+      this.loadRecommend();
+      return;
+    }
     const pageSize: number = this.recRank ? 25 : REC_PAGE_SIZE;
     const wrapAt: number = this.recRank ? 225 : 180;
     this.recPageStart = this.recPageStart >= wrapAt ? 0 : this.recPageStart + pageSize;
@@ -771,6 +851,10 @@ struct IndexPage {
    */
   private orderItems(src: RecommendItem[]): RecommendItem[] {
     const arr: RecommendItem[] = src.slice();
+    if (this.recHot) {
+      // 榜单的名次就是承诺，一律保持服务端顺序
+      return arr;
+    }
     if (this.recRank) {
       // Top250 是榜单排名，顺序就是承诺，不洗牌
       return arr;
@@ -802,6 +886,11 @@ struct IndexPage {
     }
     const v: number = Number.parseFloat(s);
     return Number.isNaN(v) ? 0 : v;
+  }
+
+  /** 当前该渲染哪一组 chip：榜单模式是六个榜单，其余是豆瓣分类 */
+  private recChipSource(): RecCat[] {
+    return this.recHot ? HOT_BOARDS : REC_CATS;
   }
 
   private currentCat(): RecCat {
@@ -2270,7 +2359,7 @@ struct IndexPage {
         if (!this.recRank) {
         Scroll() {
           Row({ space: this.chipGap() }) {
-            ForEach(REC_CATS, (cat: RecCat) => {
+            ForEach(this.recChipSource(), (cat: RecCat) => {
               this.recChip(cat)
             }, (cat: RecCat) => cat.key)
           }
@@ -2293,7 +2382,8 @@ struct IndexPage {
         // 筛选 / 排序：在分类之下再做一层「排序 · 类型 · 地区」细分
         // 左侧固定「快速筛选：」说明标签（不随横向滚动移出视野），
         // 颜色走 color_text_secondary，base/dark 两套资源自动适配深浅主题。
-        if (!this.recRank) {
+        // 榜单模式下这些都是豆瓣专用参数，60s 接口不吃，直接隐藏。
+        if (!this.recRank && !this.recHot) {
         Row({ space: this.chipGap() }) {
           Text('快速筛选：')
             .fontSize(this.filterFont())

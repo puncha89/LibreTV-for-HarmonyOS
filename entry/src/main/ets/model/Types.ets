@@ -14,6 +14,8 @@ export interface VodSource {
   failStreak: number;
   /** 停用截止时间戳（0 表示未停用） */
   disabledUntil: number;
+  /** 来自哪个订阅（订阅 id）；手动添加的源没有这个字段 */
+  subId?: string;
 }
 
 export interface LiveSource {
@@ -26,6 +28,8 @@ export interface LiveSource {
   enabled: boolean;
   failStreak: number;
   disabledUntil: number;
+  /** 来自哪个订阅（订阅 id）；手动添加的源没有这个字段 */
+  subId?: string;
 }
 
 export interface SearchItem {
@@ -43,6 +47,55 @@ export interface SearchItem {
   content?: string;
   playFrom?: string;
   playUrl?: string;
+}
+
+/** 单页搜索结果：items 是这一页的条目，totalPage 是源站声明的总页数（0 = 未声明） */
+export interface CmsSearchPage {
+  items: SearchItem[];
+  totalPage: number;
+}
+
+/**
+ * 订阅记录：对应上游「数据源订阅」条目。
+ *
+ * 上游跑在服务端，可以真的起定时任务；App 没有常驻进程，
+ * 所以语义退化成「启动 App / 进入源管理页时检查是否到期」，
+ * 到期才在后台静默同步。周期值（refreshDays）与面板选项保持一致：
+ * 0 = 关闭（纯手动），1 / 3 / 7 / 14 / 30 天。
+ */
+export interface SubscriptionRecord {
+  /** 以订阅地址生成的稳定 id */
+  id: string;
+  url: string;
+  name: string;
+  /** 刷新周期（天），0 = 关闭（纯手动） */
+  refreshDays: number;
+  /** 上次同步成功的时间戳，0 = 从未同步 */
+  lastSync: number;
+  /** 连续失败次数，达到 3 次自动暂停 */
+  failStreak: number;
+  /** 是否已暂停（连续失败 3 次后置位） */
+  paused: boolean;
+  /** 上次同步导入的点播源 / 直播源数量，仅用于展示 */
+  vodCount: number;
+  liveCount: number;
+  /** 上次失败原因，成功时清空 */
+  lastError: string;
+}
+
+/** 一次订阅同步的结果 */
+export interface SubscriptionSyncResult {
+  ok: boolean;
+  vodAdded: number;
+  liveAdded: number;
+  skipped: number;
+  error: string;
+}
+
+/** 批量探活结果汇总 */
+export interface ProbeSummary {
+  ok: number;
+  bad: number;
 }
 
 /** 跨源同名聚合后的卡片 */
@@ -226,6 +279,12 @@ export interface Settings {
   playHistoryEnabled: boolean;
   /** 自动发现源：启动时拉取内置聚合订阅并验活入库（默认关闭） */
   autoDiscover: boolean;
+  /**
+   * 每个搜索源最多抓取的页数（1-50，默认 5）。
+   * 与上游 SEARCH_MAX_PAGES 对齐：第一页读源站 pagecount，
+   * 实际页数 = min(源站总页数, 本值)；页间并行，单页失败只丢该页。
+   */
+  searchMaxPages: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -236,5 +295,6 @@ export const DEFAULT_SETTINGS: Settings = {
   recommendSource: 'douban_movie',
   defaultSpeed: 1.0,
   playHistoryEnabled: true,
-  autoDiscover: false
+  autoDiscover: false,
+  searchMaxPages: 5
 };

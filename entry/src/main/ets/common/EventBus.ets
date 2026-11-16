@@ -44,4 +44,5 @@ export class Events {
   static readonly SETTINGS_CHANGED = 'settings_changed';
   static readonly DOWNLOADS_CHANGED = 'downloads_changed';
   static readonly LIVE_FAV_CHANGED = 'live_fav_changed';
+  static readonly SUBSCRIPTIONS_CHANGED = 'subscriptions_changed';
 }

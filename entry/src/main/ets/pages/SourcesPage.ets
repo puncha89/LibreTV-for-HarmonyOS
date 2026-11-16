@@ -2,9 +2,15 @@
  * 视频源管理页：点播源（Apple CMS）/ 直播源（M3U）增删改测、订阅导入导出
  */
 
-import { VodSource, LiveSource, ExportVodEntry, ExportLiveEntry, SourceExportPayload } from '../model/Types';
+import {
+  VodSource, LiveSource, ExportVodEntry, ExportLiveEntry, SourceExportPayload,
+  SubscriptionRecord, ProbeSummary
+} from '../model/Types';
 import { SourceManager } from '../data/SourceManager';
+import { SubscriptionStore } from '../data/SubscriptionStore';
+import { SubscriptionSync } from '../model/SubscriptionSync';
 import { SubscriptionParser, FlexibleParseResult } from '../model/SubscriptionParser';
+import { M3uParser } from '../model/M3uParser';
 import { RECOMMENDED_VOD } from '../model/RecommendedSources';
 import { HttpClient } from '../net/HttpClient';
 import { pasteboard } from '@kit.BasicServicesKit';
@@ -43,6 +49,18 @@ export struct SourcesPage {
   @State showExport: boolean = false;
   /** 「一键导入推荐源」正在执行：按钮要立刻变成转圈 + 文案，否则点击后几百毫秒没反应 */
   @State importingRec: boolean = false;
+  /** 批量探活进行中 */
+  @State probingAll: boolean = false;
+  /** 订阅管理面板 */
+  @State showSubs: boolean = false;
+  @State subs: SubscriptionRecord[] = [];
+  /** 正在同步的订阅 id（空串 = 没有进行中的同步） */
+  @State syncingSubId: string = '';
+  /** M3U 导出内容（非空时显示导出面板） */
+  @State m3uText: string = '';
+  /** 发布为链接：进行中 / 结果地址 */
+  @State publishing: boolean = false;
+  @State publishedUrl: string = '';
   /** 导入开始时间戳：用于保证 busy 态的最短展示时长 */
   private importStartedAt: number = 0;
   /** busy 态最短展示时长（ms）：批量写之后真实耗时只有几十毫秒，太短会闪 */
@@ -50,6 +68,7 @@ export struct SourcesPage {
 
   aboutToAppear(): void {
     this.refresh();
+    this.refreshSubs();
     this.readClipboard();
   }
 
@@ -300,8 +319,18 @@ export struct SourcesPage {
     }
     if (fr.kind === 'json' && fr.sub !== undefined) {
       const sub = fr.sub;
-      const vodAdded = SourceManager.shared().addVodSources(sub.vod);
-      const liveAdded = SourceManager.shared().addLiveSources(sub.live);
+      // 从 URL 导入的登记成「订阅」，之后才能按周期自动刷新；
+      // 粘贴与本地文件没有可回溯的地址，不建档。
+      let subId = '';
+      if (SourcesPage.isRemoteUrl(originUrl)) {
+        subId = SubscriptionStore.shared().upsert(originUrl, sub.name).id;
+      }
+      const vodAdded = SourceManager.shared().addVodSources(sub.vod, subId);
+      const liveAdded = SourceManager.shared().addLiveSources(sub.live, subId);
+      if (subId !== '') {
+        // 手动导入一次即视为同步成功，避免「刚导入完就立刻自动再刷一遍」
+        SubscriptionStore.shared().markSuccess(subId, vodAdded, liveAdded);
+      }
       this.refresh();
       let msg = from + '：新增 ' + vodAdded + ' 个点播源、' + liveAdded + ' 个直播源';
       if (sub.skipped > 0) {
@@ -325,13 +354,24 @@ export struct SourcesPage {
       url = saved;
       name = '本地播放列表';
     }
-    const added = SourceManager.shared().addLiveSource(name, url, '');
+    let subId = '';
+    if (SourcesPage.isRemoteUrl(originUrl)) {
+      subId = SubscriptionStore.shared().upsert(originUrl, '').id;
+    }
+    const added = SourceManager.shared().addLiveSource(name, url, '', subId);
+    if (subId !== '' && added !== null) {
+      SubscriptionStore.shared().markSuccess(subId, 0, 1);
+    }
     this.refresh();
     if (added === null) {
       this.toast(from + '：该直播源已存在或添加失败');
     } else {
       this.toast(from + '：已添加「' + added.name + '」，共 ' + fr.channels.length + ' 个频道');
     }
+  }
+
+  private static isRemoteUrl(url: string): boolean {
+    return url.startsWith('http://') || url.startsWith('https://');
   }
 
   /** 把粘贴/本地导入的播放列表内容存进沙箱，返回 file:// 路径 */
@@ -534,6 +574,243 @@ export struct SourcesPage {
     return $r('app.color.color_success');
   }
 
+  // ---------- 批量探活 ----------
+
+  /**
+   * 一键探活（与上游「一键探活点播源与直播源」对齐）。
+   * 内部走的还是后台那套并发探测，所以健康度会顺带被修正 ——
+   * 探完不用再点「恢复健康度」，列表里的状态标签直接就是新的。
+   */
+  private async probeAll(): Promise<void> {
+    if (this.probingAll) {
+      return;
+    }
+    if (this.vodSources.length === 0 && this.liveSources.length === 0) {
+      this.toast('还没有可探测的源');
+      return;
+    }
+    this.probingAll = true;
+    this.toast('正在探测全部源，源多时会久一点…');
+    const sum: ProbeSummary = await SourceManager.shared().probeAllNow(true);
+    this.probingAll = false;
+    this.refresh();
+    this.toast('探测完成：' + sum.ok + ' 个可用，' + sum.bad + ' 个不可用');
+  }
+
+  // ---------- 订阅管理 ----------
+
+  private openSubs(): void {
+    this.subs = SubscriptionStore.shared().all();
+    this.showSubs = true;
+  }
+
+  private refreshSubs(): void {
+    this.subs = SubscriptionStore.shared().all();
+  }
+
+  /**
+   * 到期订阅的静默同步。
+   * 放在「进源管理页」这个时机，是因为它同时也是用户最可能清理源的地方；
+   * 失败不弹错误 —— 自动刷新失败一次不值得打断用户，状态会显示在订阅面板里。
+   */
+  private checkDueSubscriptions(): void {
+    SubscriptionSync.syncDue().then((msg: string) => {
+      this.refreshSubs();
+      this.refresh();
+      if (msg !== '') {
+        this.toast(msg);
+      }
+    }).catch(() => {
+      // 静默：自动刷新不该产生打扰
+    });
+  }
+
+  private async syncSub(rec: SubscriptionRecord): Promise<void> {
+    if (this.syncingSubId !== '') {
+      return;
+    }
+    this.syncingSubId = rec.id;
+    const msg = await SubscriptionSync.syncNow(rec.id);
+    this.syncingSubId = '';
+    this.refreshSubs();
+    this.refresh();
+    this.toast(msg);
+  }
+
+  private setSubPeriod(rec: SubscriptionRecord, days: number): void {
+    // 用 id 重新取一遍：rec 可能是面板上那一份快照
+    SubscriptionStore.shared().setRefreshDays(rec.id, days);
+    this.refreshSubs();
+    this.toast(days === 0 ? '已关闭自动刷新' : '每 ' + days + ' 天自动刷新一次');
+  }
+
+  private removeSub(rec: SubscriptionRecord): void {
+    // 订阅源由远端列表决定，删订阅时一并摘掉它名下的源（手动源不受影响）
+    SourceManager.shared().removeBySubscription(rec.id);
+    SubscriptionStore.shared().remove(rec.id);
+    this.refreshSubs();
+    this.refresh();
+    this.toast('已删除订阅「' + rec.name + '」及其导入的源');
+  }
+
+  private periodLabel(days: number): string {
+    if (days <= 0) {
+      return '关闭';
+    }
+    return days + ' 天';
+  }
+
+  /** 点一下周期就按 关闭 → 1 → 3 → 7 → 14 → 30 循环，省掉一层下拉面板 */
+  private cyclePeriod(rec: SubscriptionRecord): void {
+    const steps: number[] = [0, 1, 3, 7, 14, 30];
+    let next: number = 1;
+    for (let i = 0; i < steps.length; i++) {
+      if (steps[i] === rec.refreshDays) {
+        next = steps[(i + 1) % steps.length];
+        break;
+      }
+    }
+    this.setSubPeriod(rec, next);
+  }
+
+  private subStatus(rec: SubscriptionRecord): string {
+    if (rec.paused) {
+      return '已暂停';
+    }
+    if (rec.lastSync === 0) {
+      return '未同步';
+    }
+    return '已同步 ' + rec.vodCount + ' 点播 · ' + rec.liveCount + ' 直播';
+  }
+
+  // ---------- 导出 M3U / 发布为链接 ----------
+
+  /**
+   * 导出标准 M3U：把所有启用中直播源的频道合并成一份播放列表。
+   * 与上游「订阅可一键导出为标准 M3U，供 PotPlayer / VLC 使用」对齐 ——
+   * 这份东西不经过本 App，是给外部播放器吃的。
+   */
+  private async exportM3U(): Promise<void> {
+    const list = SourceManager.shared().getLiveSources();
+    if (list.length === 0) {
+      this.toast('没有直播源可导出');
+      return;
+    }
+    this.toast('正在汇总频道…');
+    const lines: string[] = ['#EXTM3U'];
+    const seen: Set<string> = new Set();
+    let count = 0;
+    for (const s of list) {
+      if (!s.enabled) {
+        continue;
+      }
+      const res = await HttpClient.getTextAny(s.url, { 'User-Agent': HttpClient.UA }, 12000);
+      if (!res.ok || res.text === '') {
+        continue;
+      }
+      const channels = M3uParser.parse(res.text, s.url);
+      for (const ch of channels) {
+        if (ch.url === '' || seen.has(ch.url)) {
+          continue;
+        }
+        seen.add(ch.url);
+        const name = ch.name !== '' ? ch.name : '频道';
+        const group = ch.group !== undefined && ch.group !== '' ? ch.group : s.name;
+        const logo = ch.logo !== undefined ? ch.logo : '';
+        const tvgId = ch.tvgId !== undefined ? ch.tvgId : '';
+        lines.push('#EXTINF:-1 tvg-id="' + tvgId + '" tvg-name="' + name + '" tvg-logo="' + logo
+          + '" group-title="' + group + '",' + name);
+        lines.push(ch.url);
+        count++;
+      }
+    }
+    if (count === 0) {
+      this.toast('没有可导出的频道');
+      return;
+    }
+    this.m3uText = lines.join('\n');
+    this.showExport = false;
+    this.toast('已汇总 ' + count + ' 个频道');
+  }
+
+  private copyM3U(): void {
+    const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.m3uText);
+    pasteboard.getSystemPasteboard().setDataSync(data);
+    this.toast('M3U 已复制到剪贴板');
+  }
+
+  /** M3U 面板只预览前一段：几千行全塞进 TextArea 会让面板卡住，复制仍然是全量 */
+  private m3uPreview(): string {
+    if (this.m3uText.length > 4000) {
+      return this.m3uText.substring(0, 4000) + '\n…（仅预览前 4000 字，复制的是完整内容）';
+    }
+    return this.m3uText;
+  }
+
+  /**
+   * 发布为链接：把当前启用中的源导出成 JSON，上传到公开粘贴板，返回可订阅的 URL。
+   *
+   * 主通道 paste.rs（POST 原始 body 即得 URL），失败降级 dpaste.com。
+   * 上游用的是同类服务，这里必须明确告知：**上传的内容是公开可读的**，
+   * 且每次发布都会生成新链接、不支持覆盖更新。
+   */
+  private async publishLink(): Promise<void> {
+    if (this.publishing) {
+      return;
+    }
+    this.publishing = true;
+    this.publishedUrl = '';
+    // 先确保 JSON 是最新的
+    this.exportSources();
+    const payload: string = this.exportJson;
+    const jobs: string[] = ['https://paste.rs/', 'https://dpaste.com/api/v2/'];
+    let result = '';
+    for (const endpoint of jobs) {
+      if (endpoint.indexOf('dpaste') >= 0) {
+        const res = await HttpClient.postText(endpoint, 'content=' + encodeURIComponent(payload), {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': HttpClient.UA
+        }, 15000);
+        if (res.ok) {
+          const t = res.text.trim();
+          // dpaste 返回的是纯文本 URL（可能带换行）
+          const first = t.split('\n')[0].trim();
+          if (first.startsWith('http')) {
+            result = first;
+          }
+        }
+      } else {
+        const res = await HttpClient.postText(endpoint, payload, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'User-Agent': HttpClient.UA
+        }, 15000);
+        if (res.ok) {
+          const t = res.text.trim();
+          if (t.startsWith('http')) {
+            result = t;
+          }
+        }
+      }
+      if (result !== '') {
+        break;
+      }
+    }
+    this.publishing = false;
+    if (result === '') {
+      this.toast('发布失败：粘贴板服务当前不可用，可改用「导出订阅」手动托管');
+      return;
+    }
+    this.publishedUrl = result;
+    this.showExport = true;
+    this.toast('已发布，链接有效期取决于粘贴板服务');
+  }
+
+  private copyPublished(): void {
+    const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.publishedUrl);
+    pasteboard.getSystemPasteboard().setDataSync(data);
+    this.toast('已复制链接');
+  }
+
   build() {
     NavDestination() {
       Stack({ alignContent: Alignment.Bottom }) {
@@ -639,6 +916,12 @@ export struct SourcesPage {
         if (this.showExport) {
           this.exportPanel()
         }
+        if (this.showSubs) {
+          this.subsPanel()
+        }
+        if (this.m3uText !== '') {
+          this.m3uPanel()
+        }
       }
       .width('100%')
       .height('100%')
@@ -647,6 +930,8 @@ export struct SourcesPage {
     .onShown(() => {
       // 缓存节点复用不会重跑 aboutToAppear：源可能在别处被增删过，重新读一遍
       this.refresh();
+      // 与上游一致：进源管理页也算一次「打开」，顺手检查有没有到期的订阅
+      this.checkDueSubscriptions();
     })
   }
 
@@ -763,6 +1048,50 @@ export struct SourcesPage {
       }
       .width('100%')
 
+      // 第二行：探活与订阅。这两件事都会跑网络，单独一行避免和「添加/导入」抢注意力，
+      // 也顺手把第一行挤得没那么满。
+      Row({ space: 8 }) {
+        Button() {
+          Row({ space: 6 }) {
+            if (this.probingAll) {
+              LoadingProgress()
+                .width(14)
+                .height(14)
+                .color($r('app.color.color_primary'))
+            }
+            Text(this.probingAll ? '探测中…' : '一键探活')
+              .fontSize(13)
+              .fontColor($r('app.color.color_primary'))
+              .maxLines(1)
+          }
+          .alignItems(VerticalAlign.Center)
+          .justifyContent(FlexAlign.Center)
+        }
+        .layoutWeight(1)
+        .height(34)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(17)
+        .enabled(!this.probingAll)
+        .opacity(this.probingAll ? 0.7 : 1)
+        .onClick(() => {
+          this.probeAll();
+        })
+        Button() {
+          Text('订阅管理' + (this.subs.length > 0 ? '（' + this.subs.length + '）' : ''))
+            .fontSize(13)
+            .fontColor($r('app.color.color_text'))
+            .maxLines(1)
+        }
+        .layoutWeight(1)
+        .height(34)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(17)
+        .onClick(() => {
+          this.openSubs();
+        })
+      }
+      .width('100%')
+
       if (this.vodSources.length === 0) {
         EmptyView({ emptyText: '暂无点播源，请添加或导入订阅' })
       } else {
@@ -836,18 +1165,46 @@ export struct SourcesPage {
       Column()
         .width('100%')
         .height(64 + SystemInsets.top())
-      Button() {
-        Text('添加直播源')
-          .fontSize(13)
-          .fontColor(Color.White)
+      Row({ space: 8 }) {
+        Button() {
+          Text('添加直播源')
+            .fontSize(13)
+            .fontColor(Color.White)
+        }
+        .layoutWeight(1)
+        .height(38)
+        .backgroundColor($r('app.color.color_primary'))
+        .borderRadius(19)
+        .onClick(() => {
+          this.showAddLive = !this.showAddLive;
+        })
+        Button() {
+          Row({ space: 6 }) {
+            if (this.probingAll) {
+              LoadingProgress()
+                .width(14)
+                .height(14)
+                .color($r('app.color.color_primary'))
+            }
+            Text(this.probingAll ? '探测中…' : '一键探活')
+              .fontSize(13)
+              .fontColor($r('app.color.color_primary'))
+              .maxLines(1)
+          }
+          .alignItems(VerticalAlign.Center)
+          .justifyContent(FlexAlign.Center)
+        }
+        .layoutWeight(1)
+        .height(38)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(19)
+        .enabled(!this.probingAll)
+        .opacity(this.probingAll ? 0.7 : 1)
+        .onClick(() => {
+          this.probeAll();
+        })
       }
       .width('100%')
-      .height(38)
-      .backgroundColor($r('app.color.color_primary'))
-      .borderRadius(19)
-      .onClick(() => {
-        this.showAddLive = !this.showAddLive;
-      })
 
       if (this.liveSources.length === 0) {
         EmptyView({ emptyText: '暂无直播源，请添加 M3U 订阅' })
@@ -1187,6 +1544,163 @@ export struct SourcesPage {
   }
 
   @Builder
+  subsPanel() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Text('数据源订阅')
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.color_text'))
+          .layoutWeight(1)
+        Text('关闭')
+          .fontSize(13)
+          .fontColor($r('app.color.color_primary'))
+          .onClick(() => {
+            this.showSubs = false;
+          })
+      }
+      .width('100%')
+
+      Text('只有通过「地址导入」进来的源才会建档。订阅以远端列表为准：单独删掉的条目会在下次同步时回来；'
+        + 'App 没有后台常驻进程，自动刷新只在打开 App 或进入本页时检查是否到期。')
+        .fontSize(11)
+        .fontColor($r('app.color.color_text_secondary'))
+        .width('100%')
+        .textAlign(TextAlign.Start)
+
+      if (this.subs.length === 0) {
+        Text('还没有订阅。点顶部「导入」，填一个订阅地址就会自动建档。')
+          .fontSize(12)
+          .fontColor($r('app.color.color_text_secondary'))
+          .width('100%')
+          .padding({ top: 8, bottom: 8 })
+          .textAlign(TextAlign.Start)
+      } else {
+        List({ space: 8 }) {
+          ForEach(this.subs, (rec: SubscriptionRecord) => {
+            ListItem() {
+              Column({ space: 6 }) {
+                Row({ space: 8 }) {
+                  Text(rec.name)
+                    .fontSize(14)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor($r('app.color.color_text'))
+                    .layoutWeight(1)
+                    .maxLines(1)
+                  TagText({
+                    tagText: this.subStatus(rec),
+                    tagColor: rec.paused ? $r('app.color.color_warning') : $r('app.color.color_text_secondary')
+                  })
+                }
+                .width('100%')
+
+                Text(rec.url)
+                  .fontSize(10)
+                  .fontColor($r('app.color.color_text_secondary'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .width('100%')
+
+                Row({ space: 14 }) {
+                  Text('刷新：' + this.periodLabel(rec.refreshDays))
+                    .fontSize(12)
+                    .fontColor($r('app.color.color_primary'))
+                    .onClick(() => {
+                      this.cyclePeriod(rec);
+                    })
+                  Text(this.syncingSubId === rec.id ? '同步中…' : '立即同步')
+                    .fontSize(12)
+                    .fontColor($r('app.color.color_primary'))
+                    .onClick(() => {
+                      this.syncSub(rec);
+                    })
+                  Text('删除')
+                    .fontSize(12)
+                    .fontColor($r('app.color.color_warning'))
+                    .onClick(() => {
+                      this.removeSub(rec);
+                    })
+                }
+                .width('100%')
+
+                if (rec.paused && rec.lastError !== '') {
+                  Text('连续失败已暂停：' + rec.lastError)
+                    .fontSize(10)
+                    .fontColor($r('app.color.color_warning'))
+                    .width('100%')
+                    .textAlign(TextAlign.Start)
+                }
+              }
+              .width('100%')
+              .padding(12)
+              .backgroundColor($r('app.color.color_glass'))
+              .borderRadius(10)
+            }
+            // key 带上周期与同步状态：点周期/同步后对象是就地改字段，
+            // ForEach 不重建的话面板上显示的还是旧值
+          }, (rec: SubscriptionRecord) => rec.id + '_' + rec.refreshDays + '_'
+            + (rec.paused ? 'p' : 'a') + '_' + rec.lastSync + '_' + rec.failStreak)
+        }
+        .height(300)
+        .scrollBar(BarState.Off)
+      }
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor($r('app.color.color_panel_glass'))
+    .backgroundEffect({ radius: 26, saturation: 1.5 })
+    .border({ width: 1, color: $r('app.color.color_nav_border') })
+    .borderRadius(10)
+  }
+
+  @Builder
+  m3uPanel() {
+    Column({ space: 10 }) {
+      Row({ space: 8 }) {
+        Text('导出 M3U')
+          .fontSize(15)
+          .fontWeight(FontWeight.Bold)
+          .fontColor($r('app.color.color_text'))
+          .layoutWeight(1)
+        Text('关闭')
+          .fontSize(13)
+          .fontColor($r('app.color.color_primary'))
+          .onClick(() => {
+            this.m3uText = '';
+          })
+      }
+      .width('100%')
+
+      Text('标准 M3U 播放列表，可直接丢给 PotPlayer / VLC / 电视盒子。已按频道地址去重。')
+        .fontSize(11)
+        .fontColor($r('app.color.color_text_secondary'))
+        .width('100%')
+        .textAlign(TextAlign.Start)
+
+      TextArea({ text: this.m3uPreview() })
+        .height(180)
+        .fontSize(11)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(8)
+        .padding(10)
+
+      Button('复制 M3U 到剪贴板')
+        .fontSize(14)
+        .width('100%')
+        .backgroundColor($r('app.color.color_primary'))
+        .onClick(() => {
+          this.copyM3U();
+        })
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor($r('app.color.color_panel_glass'))
+    .backgroundEffect({ radius: 26, saturation: 1.5 })
+    .border({ width: 1, color: $r('app.color.color_nav_border') })
+    .borderRadius(10)
+  }
+
+  @Builder
   exportPanel() {
     Column({ space: 10 }) {
       Row({ space: 8 }) {
@@ -1200,6 +1714,9 @@ export struct SourcesPage {
           .fontColor($r('app.color.color_primary'))
           .onClick(() => {
             this.showExport = false;
+            // 关掉面板就把上次发布的链接清掉：留着会让下次打开时
+            // 误以为是这次生成的，进而复制到一条陈旧地址
+            this.publishedUrl = '';
           })
       }
       .width('100%')
@@ -1221,6 +1738,75 @@ export struct SourcesPage {
         .onClick(() => {
           this.copyExport();
         })
+
+      // 与上游对齐的另外两种分享方式：给外部播放器的 M3U、给别人订阅的公开链接
+      Row({ space: 8 }) {
+        Button() {
+          Text('导出 M3U')
+            .fontSize(13)
+            .fontColor($r('app.color.color_primary'))
+            .maxLines(1)
+        }
+        .layoutWeight(1)
+        .height(34)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(17)
+        .onClick(() => {
+          this.exportM3U();
+        })
+        Button() {
+          Row({ space: 6 }) {
+            if (this.publishing) {
+              LoadingProgress()
+                .width(14)
+                .height(14)
+                .color($r('app.color.color_primary'))
+            }
+            Text(this.publishing ? '发布中…' : '发布为链接')
+              .fontSize(13)
+              .fontColor($r('app.color.color_primary'))
+              .maxLines(1)
+          }
+          .alignItems(VerticalAlign.Center)
+          .justifyContent(FlexAlign.Center)
+        }
+        .layoutWeight(1)
+        .height(34)
+        .backgroundColor($r('app.color.color_chip_bg'))
+        .borderRadius(17)
+        .enabled(!this.publishing)
+        .opacity(this.publishing ? 0.7 : 1)
+        .onClick(() => {
+          this.publishLink();
+        })
+      }
+      .width('100%')
+
+      if (this.publishedUrl !== '') {
+        Column({ space: 6 }) {
+          Text('已发布。注意：内容是公开可读的，每次发布生成新链接，无法覆盖更新。')
+            .fontSize(10)
+            .fontColor($r('app.color.color_warning'))
+            .width('100%')
+            .textAlign(TextAlign.Start)
+          Text(this.publishedUrl)
+            .fontSize(11)
+            .fontColor($r('app.color.color_primary'))
+            .width('100%')
+            .textAlign(TextAlign.Start)
+            .copyOption(CopyOptions.LocalDevice)
+          Button('复制链接')
+            .fontSize(13)
+            .width('100%')
+            .height(32)
+            .backgroundColor($r('app.color.color_chip_bg'))
+            .fontColor($r('app.color.color_primary'))
+            .onClick(() => {
+              this.copyPublished();
+            })
+        }
+        .width('100%')
+      }
     }
     .width('100%')
     .padding(12)

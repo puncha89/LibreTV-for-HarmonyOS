@@ -225,8 +225,8 @@ export struct PlayerPage {
   private seekDragging: boolean = false;
   /** 长按后抬手要吃掉这次 click，否则会顺带把控制条呼出来 */
   private suppressTap: boolean = false;
-  /** 长按加速的倍速 */
-  private static readonly PRESS_SPEED: number = 2.0;
+  /** 长按加速的倍速（与上游 LibreTV「移动端长按 3 倍速」对齐） */
+  private static readonly PRESS_SPEED: number = 3.0;
   /** 长按判定时长（毫秒）：太短会和"轻点唤出控制条"撞车 */
   private static readonly PRESS_DELAY_MS: number = 380;
   /** 横向滑满一屏对应的跳转时长（毫秒） */

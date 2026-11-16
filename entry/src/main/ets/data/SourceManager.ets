@@ -4,15 +4,18 @@
  */
 
 import { Store } from './Store';
-import { VodSource, LiveSource } from '../model/Types';
+import { VodSource, LiveSource, ProbeSummary } from '../model/Types';
 import { EventBus, Events } from '../common/EventBus';
 import { Utils } from '../common/Utils';
 import { HttpClient } from '../net/HttpClient';
 import { M3uParser } from '../model/M3uParser';
 
 export class SourceManager {
-  static readonly MAX_VOD = 50;
-  static readonly MAX_LIVE = 20;
+  // 与 LibreTV 源列表格式的上限对齐（sources 最多 100、liveSources 最多 50）。
+  // 之前是 50 / 20，导入一份常见的 TVBOX 单仓配置就会被截断，用户看到的是
+  // 「导入了 50 个」而远端明明有一百多个 —— 表现为「导入不全」。
+  static readonly MAX_VOD = 100;
+  static readonly MAX_LIVE = 50;
   private static readonly KEY_VOD = 'sources_vod';
   private static readonly KEY_LIVE = 'sources_live';
   /** 用户手动删除过的源 key（stableId(url)）：自动发现时永不重新加入 */
@@ -226,7 +229,7 @@ export class SourceManager {
     return source;
   }
 
-  addVodSources(sources: VodSource[]): number {
+  addVodSources(sources: VodSource[], subId: string = ''): number {
     this.load();
     let added = 0;
     for (const s of sources) {
@@ -250,6 +253,9 @@ export class SourceManager {
         failStreak: 0,
         disabledUntil: 0
       };
+      if (subId !== '') {
+        source.subId = subId;
+      }
       this.vodSources.push(source);
       added++;
     }
@@ -257,6 +263,26 @@ export class SourceManager {
       this.save();
     }
     return added;
+  }
+
+  /** 同步订阅时整体替换：先摘掉该订阅名下的旧源，再重新导入 */
+  removeBySubscription(subId: string): void {
+    this.load();
+    const nextVod: VodSource[] = [];
+    for (const s of this.vodSources) {
+      if (s.subId !== subId) {
+        nextVod.push(s);
+      }
+    }
+    const nextLive: LiveSource[] = [];
+    for (const s of this.liveSources) {
+      if (s.subId !== subId) {
+        nextLive.push(s);
+      }
+    }
+    this.vodSources = nextVod;
+    this.liveSources = nextLive;
+    this.save();
   }
 
   removeVodSource(key: string): void {
@@ -296,7 +322,7 @@ export class SourceManager {
     this.save();
   }
 
-  addLiveSource(name: string, rawUrl: string, epg: string): LiveSource | null {
+  addLiveSource(name: string, rawUrl: string, epg: string, subId: string = ''): LiveSource | null {
     this.load();
     const url = rawUrl.trim();
     while (url.endsWith('/') && url.length > 8) {
@@ -324,12 +350,15 @@ export class SourceManager {
       failStreak: 0,
       disabledUntil: 0
     };
+    if (subId !== '') {
+      source.subId = subId;
+    }
     this.liveSources.push(source);
     this.save();
     return source;
   }
 
-  addLiveSources(sources: LiveSource[]): number {
+  addLiveSources(sources: LiveSource[], subId: string = ''): number {
     this.load();
     let added = 0;
     for (const s of sources) {
@@ -343,7 +372,7 @@ export class SourceManager {
       if (exists || this.liveSources.length >= SourceManager.MAX_LIVE) {
         continue;
       }
-      this.liveSources.push({
+      const source: LiveSource = {
         key: Utils.stableId(s.url),
         name: s.name,
         url: s.url,
@@ -351,7 +380,11 @@ export class SourceManager {
         enabled: s.enabled,
         failStreak: 0,
         disabledUntil: 0
-      });
+      };
+      if (subId !== '') {
+        source.subId = subId;
+      }
+      this.liveSources.push(source);
       added++;
     }
     if (added > 0) {
@@ -588,7 +621,24 @@ export class SourceManager {
     }, 30 * 60 * 1000);
   }
 
-  private static async probeAllVod(): Promise<void> {
+  /**
+   * 一键探活（源管理页按钮）—— 与上游「一键探活点播源与直播源」对齐。
+   * 内部复用后台那套并发探测，只是把结果汇总回给 UI。
+   * 探活本身会走 recordSuccess / recordFailure，等于顺手修一遍健康度。
+   */
+  async probeAllNow(includeLive: boolean): Promise<ProbeSummary> {
+    const vod = await SourceManager.probeAllVod();
+    let ok = vod.ok;
+    let bad = vod.bad;
+    if (includeLive) {
+      const live = await SourceManager.probeAllLive();
+      ok += live.ok;
+      bad += live.bad;
+    }
+    return { ok: ok, bad: bad };
+  }
+
+  private static async probeAllVod(): Promise<ProbeSummary> {
     const sm = SourceManager.shared();
     const all = sm.getVodSources();
     const enabled: VodSource[] = [];
@@ -597,18 +647,59 @@ export class SourceManager {
         enabled.push(s);
       }
     }
+    let ok = 0;
+    let bad = 0;
+    // 每波 4 个：手机网络下再高就容易整批超时，反而误判成「源挂了」
     const batch = 4;
     for (let i = 0; i < enabled.length; i += batch) {
       const chunk: VodSource[] = enabled.slice(i, i + batch);
-      const tasks: Promise<void>[] = [];
+      const tasks: Promise<boolean>[] = [];
       for (const s of chunk) {
         tasks.push(sm.probeVod(s));
       }
-      await Promise.all(tasks);
+      const res = await Promise.all(tasks);
+      for (const r of res) {
+        if (r) {
+          ok++;
+        } else {
+          bad++;
+        }
+      }
     }
+    return { ok: ok, bad: bad };
   }
 
-  private async probeVod(s: VodSource): Promise<void> {
+  private static async probeAllLive(): Promise<ProbeSummary> {
+    const sm = SourceManager.shared();
+    const all = sm.getLiveSources();
+    const enabled: LiveSource[] = [];
+    for (const s of all) {
+      if (s.enabled) {
+        enabled.push(s);
+      }
+    }
+    let ok = 0;
+    let bad = 0;
+    const batch = 3;
+    for (let i = 0; i < enabled.length; i += batch) {
+      const chunk: LiveSource[] = enabled.slice(i, i + batch);
+      const tasks: Promise<boolean>[] = [];
+      for (const s of chunk) {
+        tasks.push(sm.probeLive(s));
+      }
+      const res = await Promise.all(tasks);
+      for (const r of res) {
+        if (r) {
+          ok++;
+        } else {
+          bad++;
+        }
+      }
+    }
+    return { ok: ok, bad: bad };
+  }
+
+  private async probeVod(s: VodSource): Promise<boolean> {
     try {
       const ok = await this.testVodSource(s);
       if (ok) {
@@ -616,8 +707,25 @@ export class SourceManager {
       } else {
         this.recordFailure(s.key);
       }
+      return ok;
     } catch (e) {
       this.recordFailure(s.key);
+      return false;
+    }
+  }
+
+  private async probeLive(s: LiveSource): Promise<boolean> {
+    try {
+      const count = await this.testLiveSource(s);
+      if (count >= 0) {
+        this.recordSuccess(s.key);
+      } else {
+        this.recordFailure(s.key);
+      }
+      return count >= 0;
+    } catch (e) {
+      this.recordFailure(s.key);
+      return false;
     }
   }
 

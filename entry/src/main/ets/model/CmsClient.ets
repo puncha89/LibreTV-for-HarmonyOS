@@ -4,7 +4,7 @@
  */
 
 import { HttpClient } from '../net/HttpClient';
-import { VodSource, SearchItem, VideoDetail, Episode, PlayLine } from './Types';
+import { VodSource, SearchItem, VideoDetail, Episode, PlayLine, CmsSearchPage } from './Types';
 
 export class CmsClient {
   /**
@@ -23,12 +23,52 @@ export class CmsClient {
 
   /** 搜索：/api.php/provide/vod/?ac=videolist&wd=关键词 */
   static async search(source: VodSource, wd: string): Promise<SearchItem[]> {
-    const url = CmsClient.apiBase(source) + '/?ac=videolist&wd=' + encodeURIComponent(wd);
+    const page = await CmsClient.searchPage(source, wd, 1);
+    return page.items;
+  }
+
+  /**
+   * 单页搜索：额外返回源站声明的总页数，供上层决定还要不要再抓。
+   *
+   * 上游 LibreTV 的 SEARCH_MAX_PAGES 就是靠这个 pagecount 工作的：
+   * 「实际页数 = min(源站总页数, 配置上限)」。只抓第一页时，冷门片、
+   * 老片、多集剧会明显搜不全 —— 这是移动端与 Web 版最容易感知的差距。
+   *
+   * pagecount 在不同 CMS 克隆里可能是数字、字符串，也可能压根没有，
+   * 所以统一按「解析得出 0 = 不知道」处理，由调用方退化成只抓第一页。
+   */
+  static async searchPage(source: VodSource, wd: string, pg: number): Promise<CmsSearchPage> {
+    let url = CmsClient.apiBase(source) + '/?ac=videolist&wd=' + encodeURIComponent(wd);
+    if (pg > 1) {
+      url = url + '&pg=' + pg;
+    }
     const res = await HttpClient.getText(url, HttpClient.cmsHeaders(), 8000);
     if (!res.ok) {
       throw new Error('源「' + source.name + '」请求失败');
     }
-    return CmsClient.parseSearchList(res.text, source);
+    return {
+      items: CmsClient.parseSearchList(res.text, source),
+      totalPage: CmsClient.pageCountOf(res.text)
+    };
+  }
+
+  /** 从搜索响应里读 pagecount（数字/字符串都兼容；取不到返回 0） */
+  static pageCountOf(json: string): number {
+    try {
+      const data = JSON.parse(json) as Record<string, object>;
+      const raw = data['pagecount'];
+      if (typeof raw === 'number') {
+        const n = raw as number;
+        return n > 0 ? Math.floor(n) : 0;
+      }
+      if (typeof raw === 'string') {
+        const n = Number.parseInt(raw as string, 10);
+        return !Number.isNaN(n) && n > 0 ? n : 0;
+      }
+    } catch (e) {
+      // 非 JSON 或结构异常：当作不知道总页数
+    }
+    return 0;
   }
 
   /**
