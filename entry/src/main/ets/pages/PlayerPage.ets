@@ -2366,6 +2366,9 @@ export struct PlayerPage {
           // 早先 top 26 / bottom 22 是为了避开状态栏和手势条，代价是顶部影片信息
           // 栏和底部控制条都"浮在离边一段距离的地方"，看着不像是全屏。
           .padding({ top: 0, bottom: 0 })
+          // 控制层自身不拦截触摸，让画面空白区的长按/轻点穿透到底下的点击层；
+          // 顶部栏图标、底部进度条等子组件仍各自响应命中，按钮照常可点。
+          .hitTestBehavior(HitTestMode.Transparent)
         }
 
         // 中部播放按钮：只在「已经起播过」时出现（加载阶段不该有三角，
@@ -2947,8 +2950,9 @@ export struct PlayerPage {
     const x: number = touches[0].x;
     const y: number = touches[0].y;
     if (event.type === TouchType.Down) {
-      // 控制条可见时不接管：按钮和进度条就压在画面上，抢事件会让它们点不动
-      if (this.controlsVisible || this.errorText !== '') {
+      // 控制条可见时同样接管：控制层已设为 Transparent，按钮/进度条仍各自吃掉命中，
+      // 落在画面空白区的长按可穿透下来。仅错误态让位。
+      if (this.errorText !== '') {
         return;
       }
       this.clearPressTimer();
@@ -3013,7 +3017,8 @@ export struct PlayerPage {
     this.pressSpeed = false;
     this.seekDragging = false;
     this.seekPreviewing = false;
-    this.suppressTap = jumped;
+    // 只要长按成立就吞掉随后的 click，避免抬手误触发控制条显隐切换
+    this.suppressTap = true;
     // 恢复到设置里选的倍速（不一定是 1.0）
     this.player.setSpeed(this.speedValue);
     if (jumped) {

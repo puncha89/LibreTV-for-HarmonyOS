@@ -69,6 +69,9 @@ export class AvPlayerController {
         return media.PlaybackSpeed.SPEED_FORWARD_1_50_X;
       case 2.0:
         return media.PlaybackSpeed.SPEED_FORWARD_2_00_X;
+      case 3.0:
+        // 长按 3 倍速（API 13+ 支持，与上游 LibreTV 对齐）
+        return media.PlaybackSpeed.SPEED_FORWARD_3_00_X;
       default:
         return media.PlaybackSpeed.SPEED_FORWARD_1_00_X;
     }
